@@ -1,0 +1,92 @@
+[
+  {
+    "title": "AI 产品经理（大模型应用方向）",
+    "company": "字节跳动",
+    "salary": "35-65K·15薪",
+    "location": "北京",
+    "platform": "BOSS直聘",
+    "url": "https://www.zhipin.com/job_detail/mock_bytedance_001",
+    "job_summary": "负责大模型在抖音、今日头条等核心产品的落地应用，设计AI驱动的产品功能，推动大模型技术从实验室走向亿级用户场景。需要深入理解大模型能力边界，结合业务需求定义产品方向。"
+  },
+  {
+    "title": "高级 AI 产品经理 - RAG/Agent方向",
+    "company": "阿里巴巴",
+    "salary": "40-70K·16薪",
+    "location": "杭州",
+    "platform": "BOSS直聘",
+    "url": "https://www.zhipin.com/job_detail/mock_alibaba_002",
+    "job_summary": "负责阿里云AI产品的RAG（检索增强生成）和Agent方向的产品规划与设计，构建企业级AI应用平台。需要熟悉LLM应用架构，有AI产品从0到1的经验。"
+  },
+  {
+    "title": "AI产品经理（金融科技）",
+    "company": "蚂蚁集团",
+    "salary": "35-55K·16薪",
+    "location": "上海",
+    "platform": "BOSS直聘",
+    "url": "https://www.zhipin.com/job_detail/mock_ant_003",
+    "job_summary": "负责蚂蚁集团金融科技方向的AI产品设计，包括智能风控、智能客服、智能营销等场景。需要结合大模型技术提升金融服务的效率和体验，推动AI在金融领域的创新应用。"
+  },
+  {
+    "title": "大模型产品经理",
+    "company": "腾讯",
+    "salary": "30-60K·16薪",
+    "location": "深圳",
+    "platform": "BOSS直聘",
+    "url": "https://www.zhipin.com/job_detail/mock_tencent_004",
+    "job_summary": "负责腾讯混元大模型的产品化工作，包括模型能力的产品封装、API平台建设、行业解决方案设计。需要深入理解大模型技术趋势，推动AI能力在腾讯生态内的广泛应用。"
+  },
+  {
+    "title": "AI产品经理（智能客服方向）",
+    "company": "京东",
+    "salary": "25-45K·14薪",
+    "location": "北京",
+    "platform": "猎聘",
+    "url": "https://www.liepin.com/job/mock_jd_005",
+    "job_summary": "负责京东智能客服产品的规划与迭代，基于大模型技术提升客服机器人的理解能力和服务质量。需要结合电商场景设计智能对话系统，优化用户体验和运营效率。"
+  },
+  {
+    "title": "NLP/LLM产品经理",
+    "company": "百度",
+    "salary": "30-50K·15薪",
+    "location": "北京",
+    "platform": "BOSS直聘",
+    "url": "https://www.zhipin.com/job_detail/mock_baidu_006",
+    "job_summary": "负责百度文心大模型在NLP/LLM方向的产品规划，包括文本生成、语义理解、知识问答等场景的产品设计。需要跟踪前沿AI技术，定义产品路线图并推动落地。"
+  },
+  {
+    "title": "AI产品经理（合规风控方向）",
+    "company": "平安科技",
+    "salary": "28-45K·13薪",
+    "location": "深圳",
+    "platform": "智联招聘",
+    "url": "https://www.zhaopin.com/job/mock_pingan_007",
+    "job_summary": "负责平安集团AI合规风控产品的设计，利用大模型技术构建智能合规审查、风险预警系统。需要理解金融监管要求，将AI能力与风控场景深度结合。"
+  },
+  {
+    "title": "产品经理-AI中台",
+    "company": "美团",
+    "salary": "30-55K·15薪",
+    "location": "北京",
+    "platform": "BOSS直聘",
+    "url": "https://www.zhipin.com/job_detail/mock_meituan_008",
+    "job_summary": "负责美团AI中台产品的建设，包括模型训练平台、推理服务平台、AI资产管理等基础设施的产品设计。需要为内部业务线提供高效的AI能力支撑，降低AI应用门槛。"
+  },
+  {
+    "title": "AI产品经理（对话式AI）",
+    "company": "月之暗面",
+    "salary": "40-80K·15薪",
+    "location": "北京",
+    "platform": "BOSS直聘",
+    "url": "https://www.zhipin.com/job_detail/mock_moonshot_009",
+    "job_summary": "负责月之暗面对话式AI产品的规划与设计，打造下一代智能对话助手。需要深入理解大模型能力，设计创新的交互方式和产品体验，推动AI原生应用的落地。"
+  },
+  {
+    "title": "数据产品经理",
+    "company": "滴滴出行",
+    "salary": "25-40K·14薪",
+    "location": "北京",
+    "platform": "51job",
+    "url": "https://www.51job.com/job/mock_didi_010",
+    "job_summary": "负责滴滴出行数据产品体系建设，包括数据指标管理、数据分析平台、数据可视化工具等产品设计。需要与大数据团队协作，提升数据驱动决策的效率。"
+  }
+]

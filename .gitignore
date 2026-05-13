@@ -1,0 +1,54 @@
+# ── 环境变量与密钥 ──
+.env
+.env.local
+.env.*.local
+
+# ── 浏览器用户数据（含登录态 Cookie） ──
+.chrome_profile/
+.chrome_profile_liepin/
+
+# ── 爬虫去重缓存 ──
+history_jobs.json
+processed_jobs.txt
+
+# ── 调试文件 ──
+debug_*/
+debug_*.py
+debug_*.png
+debug_*.json
+error_page*.png
+image.png
+
+# ── 日志 ──
+*.log
+scraper_cron.log
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── 虚拟环境 ──
+venv/
+.venv/
+env/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS ──
+.DS_Store
+*.DS_Store
+
+# ── 测试数据输出 ──
+*.xls
+*.xlsx
+*.csv
