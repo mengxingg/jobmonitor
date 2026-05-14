@@ -55,7 +55,14 @@ SYSTEM_PROMPT = """你是一位专业的 AI 招聘顾问，负责评估岗位与
 - <60：不推荐，匹配度低
 
 你必须返回严格的 JSON 格式（不要包含 markdown 代码块标记），格式如下：
-{"score": <0-100整数>, "match_reasons": ["优势1", "优势2", ...], "mismatch_reasons": ["不足1", "不足2", ...], "summary": "<一句话总结>"}"""
+{"score": <0-100整数>, "match_reasons": ["优势1", "优势2", ...], "mismatch_reasons": ["不足1", "不足2", ...], "summary": "<一句话总结>", "jd_summary_structured": "<结构化摘要>"}
+
+关于 jd_summary_structured 字段的要求：
+- 请综合「完整职位描述」和「职位要求」两部分文本，提炼一段约 100 字的结构化摘要
+- 摘要格式必须统一为：
+  🎯 核心职责：[用一两句话总结核心要干嘛]
+  💡 硬性要求：[提炼最核心的年限、技术栈或大模型经验要求]
+- 如果「完整职位描述」或「职位要求」为空，则根据已有信息尽力提炼"""
 
 
 def evaluate_job(
@@ -65,20 +72,24 @@ def evaluate_job(
     location: str = "",
     platform: str = "",
     jd_summary: str = "",
+    full_jd: str = "",
+    requirements: str = "",
 ) -> dict[str, Any]:
     """
     评估一个岗位与候选人的匹配度。
 
     参数:
-        title:      岗位名称
-        company:    公司名称
-        salary:     薪资范围（如 "35-65K·15薪"）
-        location:   工作地点（如 "北京"）
-        platform:   来源平台（如 "BOSS直聘"）
-        jd_summary: 职位描述摘要
+        title:        岗位名称
+        company:      公司名称
+        salary:       薪资范围（如 "35-65K·15薪"）
+        location:     工作地点（如 "北京"）
+        platform:     来源平台（如 "BOSS直聘"）
+        jd_summary:   职位描述摘要
+        full_jd:      完整职位描述（Deep Crawl 获取）
+        requirements: 完整职位要求（Deep Crawl 获取）
 
     返回:
-        {"score": int, "match_reasons": list[str], "mismatch_reasons": list[str], "summary": str}
+        {"score": int, "match_reasons": list[str], "mismatch_reasons": list[str], "summary": str, "jd_summary_structured": str}
 
     异常:
         当 API 调用失败或返回无法解析时，返回 {"score": 0, "match_reasons": [], "mismatch_reasons": [], "summary": "评估失败"}
@@ -87,7 +98,7 @@ def evaluate_job(
         logger.error("DEEPSEEK_API_KEY 未设置")
         return _fallback_result("API Key 未配置")
 
-    # 构建岗位信息
+    # 构建岗位信息（包含完整 JD 和 Requirements）
     job_info = f"""
 ## 岗位信息
 - 岗位名称：{title}
@@ -96,6 +107,8 @@ def evaluate_job(
 - 地点：{location}
 - 来源平台：{platform}
 - 职位描述：{jd_summary or "（暂无详细描述）"}
+- 完整职位描述：{full_jd or "（无）"}
+- 职位要求：{requirements or "（无）"}
 """
 
     try:
@@ -170,6 +183,11 @@ def _parse_response(content: str, company: str, title: str) -> dict[str, Any]:
     if not isinstance(summary, str):
         summary = ""
 
+    # 提取结构化摘要（AI 根据 full_jd + requirements 生成）
+    jd_summary_structured = result.get("jd_summary_structured", "")
+    if not isinstance(jd_summary_structured, str):
+        jd_summary_structured = ""
+
     logger.info(
         "AI 评估完成: %s - %s 分 (%s)",
         title,
@@ -182,6 +200,7 @@ def _parse_response(content: str, company: str, title: str) -> dict[str, Any]:
         "match_reasons": match_reasons,
         "mismatch_reasons": mismatch_reasons,
         "summary": summary,
+        "jd_summary_structured": jd_summary_structured,
     }
 
 
@@ -192,6 +211,7 @@ def _fallback_result(reason: str = "评估失败") -> dict[str, Any]:
         "match_reasons": [],
         "mismatch_reasons": [],
         "summary": reason,
+        "jd_summary_structured": "",
     }
 
 
