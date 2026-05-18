@@ -53,7 +53,6 @@ if [ -f "${PROJECT_DIR}/data/openclaw_jobs.json" ]; then
     JOB_COUNT=$(cat "${PROJECT_DIR}/data/openclaw_jobs.json" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
-# 统计 DeepSeek 和 小红书 的岗位
 deepseek = [j for j in data if j.get('company') == 'DeepSeek']
 xhs = [j for j in data if j.get('company') == '小红书']
 print(f'DeepSeek: {len(deepseek)} 条, 小红书: {len(xhs)} 条, 总计: {len(data)} 条')

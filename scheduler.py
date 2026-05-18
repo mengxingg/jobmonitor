@@ -1,26 +1,32 @@
 """
-scheduler.py — 多平台爬虫调度器
+scheduler.py — 全平台爬虫调度器（v2.0）
 
-串行调用 spider_boss 和 spider_liepin，将标准化 JobItem 统一合并后，
-统一发送给 DeepSeek 评估和 Notion 同步。
+串行调用所有爬虫（三方平台 + 官网），将标准化 JobItem 统一合并后，
+最后统一触发 openclaw_bridge.py 将增量数据推送到 Notion。
+
+数据流：
+  三方平台（BOSS直聘、猎聘）→ 各自独立 JSON
+  官网（字节、DeepSeek、小红书、腾讯、智谱、MiniMax、月之暗面、阿里）
+    → 统一写入 data/openclaw_jobs.json（增量合并）
+  最后 → openclaw_bridge.py → Notion
 
 用法:
-  python scheduler.py                    # 立即执行一轮
-  pm2 start ... -- scheduler.py          # PM2 托管定时执行
+  conda run -n job_env python scheduler.py          # 立即执行一轮全量同步
+  conda run -n job_env python scheduler.py --no-bridge  # 仅抓取，不触发 Notion 同步
 """
 
 import sys
 import io
 import time
 import logging
+import subprocess
+import os
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-
-from job_model import JobItem
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,84 +35,144 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scheduler")
 
+PROJECT_DIR = Path(__file__).parent
+BRIDGE_SCRIPT = PROJECT_DIR / "openclaw_bridge.py"
 
-def run_all_spiders() -> list[JobItem]:
+
+def _run_script(script_name: str, label: str) -> bool:
     """
-    串行运行所有爬虫，返回合并后的标准化 JobItem 列表。
-    每个爬虫独立管理自己的浏览器生命周期。
+    运行单个爬虫脚本，实时输出到终端（不使用 2>&1 重定向）。
+
+    Args:
+        script_name: 脚本文件名（如 "crawler_deepseek.py"）
+        label: 日志标签（如 "DeepSeek"）
+
+    Returns:
+        True 表示成功，False 表示失败
     """
-    all_jobs: list[JobItem] = []
+    script_path = PROJECT_DIR / script_name
+    if not script_path.exists():
+        logger.error(f"❌ 脚本不存在: {script_path}")
+        return False
 
-    # ── 1. BOSS 直聘 ──
+    logger.info(f"{'='*60}")
+    logger.info(f"🚀 [{label}] 启动 {script_name}...")
+    logger.info(f"{'='*60}")
+
     try:
-        from spider_boss import run as run_boss
-        logger.info("=" * 60)
-        logger.info("🚀 启动 BOSS 直聘爬虫...")
-        boss_jobs = run_boss()
-        if boss_jobs:
-            all_jobs.extend(boss_jobs)
-            logger.info("✅ BOSS 直聘完成: %d 条", len(boss_jobs))
+        # ★ 关键：不使用 capture_output，让 print/logger 实时回显到终端
+        result = subprocess.run(
+            ["conda", "run", "-n", "job_env", "python", str(script_path)],
+            capture_output=False,  # 实时输出到终端
+            text=True,
+            cwd=str(PROJECT_DIR),
+        )
+        if result.returncode == 0:
+            logger.info(f"✅ [{label}] 完成 (返回码: {result.returncode})")
+            return True
         else:
-            logger.warning("⚠ BOSS 直聘返回 0 条")
+            logger.error(f"❌ [{label}] 失败 (返回码: {result.returncode})")
+            return False
     except Exception as e:
-        logger.error("❌ BOSS 直聘爬虫异常: %s", e, exc_info=True)
-
-    # ── 2. 猎聘 ──
-    try:
-        from spider_liepin import run as run_liepin
-        logger.info("=" * 60)
-        logger.info("🚀 启动猎聘爬虫...")
-        liepin_jobs = run_liepin()
-        if liepin_jobs:
-            all_jobs.extend(liepin_jobs)
-            logger.info("✅ 猎聘完成: %d 条", len(liepin_jobs))
-        else:
-            logger.warning("⚠ 猎聘返回 0 条")
-    except Exception as e:
-        logger.error("❌ 猎聘爬虫异常: %s", e, exc_info=True)
-
-    # ── 汇总 ──
-    logger.info("=" * 60)
-    logger.info("📊 本轮汇总: 共 %d 条岗位（BOSS %d + 猎聘 %d）",
-                len(all_jobs),
-                sum(1 for j in all_jobs if j.platform == "BOSS直聘"),
-                sum(1 for j in all_jobs if j.platform == "猎聘"))
-
-    return all_jobs
+        logger.error(f"❌ [{label}] 异常: {e}")
+        return False
 
 
-def run_scrapers():
-    """定时任务入口：串行执行所有爬虫"""
+def run_all_spiders() -> None:
+    """
+    串行运行所有爬虫，按顺序执行。
+
+    执行顺序：
+      1. 三方平台：BOSS直聘、猎聘（使用 DrissionPage，独立浏览器）
+      2. 官网 API 类：腾讯（requests，轻量）
+      3. 官网 Playwright 类：字节、DeepSeek、小红书、月之暗面、智谱、MiniMax、阿里
+    """
+    start_time = time.time()
     print(f"\n{'='*60}")
-    print(f"========== {datetime.now()} 启动本轮多平台抓取 ==========")
+    print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 启动全平台抓取")
+    print(f"{'='*60}\n")
+
+    # ── 第一阶段：三方平台 ──
+    logger.info("📌 第一阶段：三方招聘平台")
+    _run_script("spider_boss.py", "BOSS直聘")
+    _run_script("spider_liepin.py", "猎聘")
+
+    # ── 第二阶段：官网 API 类（轻量，无需浏览器） ──
+    logger.info("\n📌 第二阶段：官网 API 类爬虫")
+    _run_script("crawler_tencent.py", "腾讯")
+
+    # ── 第三阶段：官网 Playwright 类（需要浏览器） ──
+    logger.info("\n📌 第三阶段：官网 Playwright 爬虫")
+    _run_script("bytedance_visual_crawler.py", "字节跳动")
+    _run_script("crawler_deepseek.py", "DeepSeek")
+    _run_script("crawler_xiaohongshu.py", "小红书")
+    _run_script("crawler_moonshot.py", "月之暗面")
+    _run_script("crawler_zhipu.py", "智谱AI")
+    _run_script("crawler_minimax.py", "MiniMax")
+    _run_script("crawler_alibaba.py", "阿里巴巴")
+
+    elapsed = time.time() - start_time
+    print(f"\n{'='*60}")
+    print(f"✅ 全平台抓取完成！耗时 {elapsed:.0f} 秒")
     print(f"{'='*60}")
 
-    all_jobs = run_all_spiders()
+
+def run_bridge() -> None:
+    """最后统一触发 openclaw_bridge.py 推送到 Notion"""
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🔄 统一触发桥接脚本: openclaw_bridge.py")
+    logger.info(f"{'='*60}")
+
+    # ★ 同步前置检查：确保 data/openclaw_jobs.json 存在且大小正常
+    output_file = PROJECT_DIR / "data" / "openclaw_jobs.json"
+    if not output_file.exists():
+        logger.error(f"❌ 文件不存在: {output_file}，跳过 Notion 写入")
+        return
+    file_size = output_file.stat().st_size
+    if file_size < 1024:  # <1KB
+        logger.error(f"❌ 文件大小异常 ({file_size} bytes < 1KB)，跳过 Notion 写入")
+        return
+    logger.info(f"✅ 前置检查通过: {output_file} ({file_size} bytes)")
+
+    try:
+        env = dict(os.environ)
+        env["FORCE_UPDATE"] = "1"
+        result = subprocess.run(
+            ["conda", "run", "-n", "job_env", "python", str(BRIDGE_SCRIPT)],
+            capture_output=False,  # 实时输出
+            text=True,
+            env=env,
+            cwd=str(PROJECT_DIR),
+        )
+        if result.returncode == 0:
+            logger.info(f"✅ 桥接脚本执行完成")
+        else:
+            logger.error(f"❌ 桥接脚本失败 (返回码: {result.returncode})")
+    except Exception as e:
+        logger.error(f"❌ 桥接脚本异常: {e}")
+
+
+def run_scrapers(no_bridge: bool = False):
+    """全量同步入口"""
+    print(f"\n{'='*60}")
+    print(f"📅 {datetime.now()} 启动本轮全平台抓取")
+    print(f"{'='*60}")
+
+    run_all_spiders()
+
+    if not no_bridge:
+        run_bridge()
+    else:
+        logger.info("跳过 Notion 桥接（--no-bridge 模式）")
 
     print(f"\n{'='*60}")
-    print(f"========== {datetime.now()} 本轮抓取完成（共 {len(all_jobs)} 条） ==========")
+    print(f"📅 {datetime.now()} 本轮全量同步完成")
     print(f"{'='*60}")
 
 
 # ==========================================
-# 定时调度配置
+# 入口
 # ==========================================
-USE_SCHEDULE = False  # 默认不启用内建定时，由 PM2 控制重启频率
-
-if USE_SCHEDULE:
-    import schedule
-
-    # 每天 07:00 到 23:00，每两小时执行一次
-    for hour in range(7, 24, 2):
-        time_str = f"{hour:02d}:00"
-        schedule.every().day.at(time_str).do(run_scrapers)
-
-    print("调度器已启动（内建定时模式），等待执行任务...")
-    run_scrapers()  # 立即执行一次
-
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-else:
-    # PM2 托管模式：立即执行一次后退出，由 PM2 的 restart 策略控制频率
-    run_scrapers()
+if __name__ == "__main__":
+    no_bridge = "--no-bridge" in sys.argv
+    run_scrapers(no_bridge=no_bridge)
