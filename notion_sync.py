@@ -353,6 +353,213 @@ def _make_heading_2(text: str) -> dict:
     }
 
 
+# ── 深度背调报告锚点常量 ──
+REPORT_ANCHOR_TEXT = "🤖 InterviewOS 深度背调报告"
+
+
+def _get_all_page_blocks(page_id: str) -> list[dict]:
+    """
+    获取页面所有 blocks（自动处理分页）。
+    
+    返回 block 列表，每个 block 包含 id, type, 以及对应类型的内容。
+    """
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+    all_blocks = []
+    start_cursor = None
+
+    while True:
+        url = f"{NOTION_BASE_URL}/blocks/{page_id}/children"
+        params = {"page_size": 100}
+        if start_cursor:
+            params["start_cursor"] = start_cursor
+
+        try:
+            resp = _notion_request_with_retry(
+                "GET", url, headers=headers, params=params, timeout=15,
+            )
+            data = resp.json()
+            results = data.get("results", [])
+            all_blocks.extend(results)
+
+            if not data.get("has_more"):
+                break
+            start_cursor = data.get("next_cursor")
+        except Exception as e:
+            logger.error(f"获取页面 blocks 失败 (page_id={page_id}): {e}")
+            break
+
+    return all_blocks
+
+
+def _find_anchor_block_index(blocks: list[dict]) -> int:
+    """
+    在 blocks 列表中查找锚点 heading_2 的位置。
+    
+    遍历 blocks，寻找文本内容完全匹配 REPORT_ANCHOR_TEXT 的 heading_2 block。
+    如果找到，返回其在列表中的索引；否则返回 -1。
+    """
+    for idx, block in enumerate(blocks):
+        block_type = block.get("type", "")
+        if block_type != "heading_2":
+            continue
+        heading_2 = block.get("heading_2", {})
+        rich_text = heading_2.get("rich_text", [])
+        if not rich_text:
+            continue
+        text_content = "".join(
+            rt.get("text", {}).get("content", "")
+            for rt in rich_text
+            if rt.get("type") == "text"
+        )
+        if text_content.strip() == REPORT_ANCHOR_TEXT:
+            logger.info(f"找到锚点 block (index={idx}, block_id={block.get('id')})")
+            return idx
+    return -1
+
+
+def _delete_blocks_from_index(page_id: str, blocks: list[dict], start_index: int) -> bool:
+    """
+    从指定索引开始，删除该索引及其之后的所有 blocks。
+    
+    参数:
+        page_id: 页面 ID（仅用于日志）
+        blocks: 完整的 blocks 列表
+        start_index: 从此索引开始删除（含该索引）
+    
+    返回:
+        全部删除成功返回 True，部分失败返回 False
+    """
+    if start_index < 0 or start_index >= len(blocks):
+        logger.warning(f"无效的 start_index={start_index} (blocks 总数={len(blocks)})")
+        return False
+
+    target_blocks = blocks[start_index:]
+    logger.info(f"准备删除 {len(target_blocks)} 个 blocks (从索引 {start_index} 开始)")
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    all_success = True
+    for block in target_blocks:
+        block_id = block.get("id")
+        if not block_id:
+            logger.warning(f"block 缺少 id，跳过: {block}")
+            continue
+        try:
+            resp = _notion_request_with_retry(
+                "DELETE",
+                f"{NOTION_BASE_URL}/blocks/{block_id}",
+                headers=headers,
+                timeout=15,
+            )
+            if not resp.ok:
+                logger.warning(f"删除 block 失败 (id={block_id}): {resp.status_code}")
+                all_success = False
+        except Exception as e:
+            logger.error(f"删除 block 异常 (id={block_id}): {e}")
+            all_success = False
+
+    if all_success:
+        logger.info(f"成功删除 {len(target_blocks)} 个 blocks")
+    else:
+        logger.warning(f"部分 blocks 删除失败，请检查日志")
+    return all_success
+
+
+def _append_blocks(page_id: str, new_blocks: list[dict]) -> bool:
+    """
+    将新 blocks 追加到页面底部。
+    
+    使用 PATCH /v1/blocks/{page_id}/children API。
+    Notion 限制每次最多追加 100 个 block，超长时自动分批。
+    """
+    if not new_blocks:
+        logger.info("没有新 blocks 需要追加")
+        return True
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    # Notion API 限制：单次最多追加 100 个 block
+    BATCH_SIZE = 100
+    all_success = True
+
+    for i in range(0, len(new_blocks), BATCH_SIZE):
+        batch = new_blocks[i:i + BATCH_SIZE]
+        try:
+            resp = _notion_request_with_retry(
+                "PATCH",
+                f"{NOTION_BASE_URL}/blocks/{page_id}/children",
+                headers=headers,
+                json={"children": batch},
+                timeout=30,
+            )
+            if not resp.ok:
+                logger.error(f"追加 blocks 失败 (batch {i//BATCH_SIZE + 1}): {resp.status_code} {resp.text[:200]}")
+                all_success = False
+            else:
+                logger.info(f"成功追加 batch {i//BATCH_SIZE + 1} ({len(batch)} blocks)")
+        except Exception as e:
+            logger.error(f"追加 blocks 异常 (batch {i//BATCH_SIZE + 1}): {e}")
+            all_success = False
+
+    return all_success
+
+
+def replace_report_blocks(page_id: str, report_blocks: list[dict]) -> bool:
+    """
+    替换页面中的深度背调报告（原子化操作）。
+    
+    流程:
+        1. 获取页面所有 blocks
+        2. 查找锚点 heading_2（"🤖 InterviewOS 深度背调报告"）
+        3. 如果找到锚点，删除锚点及其之后的所有 blocks
+        4. 追加新的报告 blocks（含锚点标记）
+    
+    参数:
+        page_id: Notion 页面 ID
+        report_blocks: 新的报告 blocks 列表（必须已包含锚点 heading_2）
+    
+    返回:
+        成功 True，失败 False
+    """
+    logger.info(f"开始替换页面报告 (page_id={page_id})")
+
+    # 1. 获取所有 blocks
+    all_blocks = _get_all_page_blocks(page_id)
+    logger.info(f"页面共有 {len(all_blocks)} 个 blocks")
+
+    # 2. 查找锚点
+    anchor_index = _find_anchor_block_index(all_blocks)
+
+    # 3. 如果找到锚点，删除旧报告
+    if anchor_index >= 0:
+        logger.info(f"发现旧报告 (从索引 {anchor_index} 开始)，执行删除...")
+        delete_ok = _delete_blocks_from_index(page_id, all_blocks, anchor_index)
+        if not delete_ok:
+            logger.warning("旧报告删除不完全，继续尝试写入新报告...")
+    else:
+        logger.info("未找到旧报告锚点，直接追加新报告")
+
+    # 4. 追加新报告
+    append_ok = _append_blocks(page_id, report_blocks)
+    if append_ok:
+        logger.info(f"报告替换完成，共写入 {len(report_blocks)} 个 blocks")
+    else:
+        logger.error("报告写入失败")
+    return append_ok
+
+
 def _build_jd_children(
     job_description: str = "",
     job_requirements: str = "",

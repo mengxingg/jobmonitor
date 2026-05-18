@@ -18,11 +18,14 @@ scheduler.py — 全平台爬虫调度器（v2.0）
 import sys
 import io
 import time
+import json
 import logging
 import subprocess
 import os
+import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -38,10 +41,100 @@ logger = logging.getLogger("scheduler")
 PROJECT_DIR = Path(__file__).parent
 BRIDGE_SCRIPT = PROJECT_DIR / "openclaw_bridge.py"
 
+# ── 飞书告警配置（从 .env 加载） ──
+from dotenv import load_dotenv
+_env_path = PROJECT_DIR / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
+
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+# 爬虫告警接收会话 ID（默认发送给机器人自己，可在 .env 中配置 SCRAPER_ALARM_CHAT_ID）
+SCRAPER_ALARM_CHAT_ID = os.getenv("SCRAPER_ALARM_CHAT_ID", "")
+
+
+def _get_feishu_tenant_token() -> Optional[str]:
+    """
+    获取飞书 tenant_access_token，用于发送消息。
+    返回 token 字符串，失败返回 None。
+    """
+    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+        logger.warning("[Alarm] 飞书凭证未配置，无法发送告警")
+        return None
+    try:
+        import requests
+        resp = requests.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+            timeout=10,
+        )
+        if resp.ok:
+            return resp.json().get("tenant_access_token", "")
+        else:
+            logger.error(f"[Alarm] 获取 tenant_token 失败: {resp.status_code} {resp.text}")
+            return None
+    except Exception as e:
+        logger.error(f"[Alarm] 获取 tenant_token 异常: {e}")
+        return None
+
+
+def send_scraper_alarm(platform: str, error_msg: str) -> None:
+    """
+    向飞书发送爬虫任务异常告警消息。
+    
+    参数:
+        platform: 招聘网站名称（如 "Boss直聘"、"猎聘"）
+        error_msg: 捕获到的关键异常信息
+    """
+    if not SCRAPER_ALARM_CHAT_ID:
+        logger.info("[Alarm] SCRAPER_ALARM_CHAT_ID 未配置，跳过飞书告警")
+        return
+
+    token = _get_feishu_tenant_token()
+    if not token:
+        logger.error("[Alarm] 无法获取飞书 token，告警发送失败")
+        return
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 截断过长的错误信息
+    if len(error_msg) > 500:
+        error_msg = error_msg[:500] + "..."
+
+    alert_text = (
+        f"🚨 **InterviewOS | 爬虫任务运行异常告警**\n"
+        f"🖥️ 目标平台：{platform}\n"
+        f"⏱️ 发生时间：{now_str}\n"
+        f"❌ 错误摘要：{error_msg}\n"
+        f"🛠️ 排查建议：请检查该平台爬虫的凭证或防爬策略。"
+    )
+
+    try:
+        import requests
+        resp = requests.post(
+            f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "receive_id": SCRAPER_ALARM_CHAT_ID,
+                "msg_type": "text",
+                "content": json.dumps({"text": alert_text}, ensure_ascii=False),
+            },
+            timeout=10,
+        )
+        if resp.ok:
+            logger.info(f"[Alarm] 爬虫告警已发送至飞书（平台: {platform}）")
+        else:
+            logger.error(f"[Alarm] 飞书告警发送失败: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"[Alarm] 飞书告警发送异常: {e}")
+
 
 def _run_script(script_name: str, label: str) -> bool:
     """
     运行单个爬虫脚本，实时输出到终端（不使用 2>&1 重定向）。
+    捕获异常时自动触发飞书告警，但不影响其他平台。
 
     Args:
         script_name: 脚本文件名（如 "crawler_deepseek.py"）
@@ -52,7 +145,9 @@ def _run_script(script_name: str, label: str) -> bool:
     """
     script_path = PROJECT_DIR / script_name
     if not script_path.exists():
-        logger.error(f"❌ 脚本不存在: {script_path}")
+        error_msg = f"脚本文件不存在: {script_path}"
+        logger.error(f"❌ [{label}] {error_msg}")
+        send_scraper_alarm(label, error_msg)
         return False
 
     logger.info(f"{'='*60}")
@@ -60,9 +155,11 @@ def _run_script(script_name: str, label: str) -> bool:
     logger.info(f"{'='*60}")
 
     try:
-        # ★ 关键：不使用 capture_output，让 print/logger 实时回显到终端
+        # ★ 关键：使用 sys.executable 而非 conda run，避免子进程环境变量丢失
+        #   scheduler.py 已被 job_env 下的 Python 解释器启动，
+        #   sys.executable 自动指向当前环境的 Python 绝对路径。
         result = subprocess.run(
-            ["conda", "run", "-n", "job_env", "python", str(script_path)],
+            [sys.executable, str(script_path)],
             capture_output=False,  # 实时输出到终端
             text=True,
             cwd=str(PROJECT_DIR),
@@ -71,10 +168,26 @@ def _run_script(script_name: str, label: str) -> bool:
             logger.info(f"✅ [{label}] 完成 (返回码: {result.returncode})")
             return True
         else:
-            logger.error(f"❌ [{label}] 失败 (返回码: {result.returncode})")
+            error_msg = f"脚本返回非零退出码: {result.returncode}"
+            logger.error(f"❌ [{label}] {error_msg}")
+            send_scraper_alarm(label, error_msg)
             return False
+    except subprocess.TimeoutExpired:
+        error_msg = "爬虫脚本执行超时（300s）"
+        logger.error(f"❌ [{label}] {error_msg}")
+        send_scraper_alarm(label, error_msg)
+        return False
+    except FileNotFoundError:
+        error_msg = f"Python 解释器未找到: {sys.executable}"
+        logger.error(f"❌ [{label}] {error_msg}")
+        send_scraper_alarm(label, error_msg)
+        return False
     except Exception as e:
+        tb = traceback.format_exc()
+        error_msg = f"{e}\n{tb[:300]}"
         logger.error(f"❌ [{label}] 异常: {e}")
+        logger.debug(f"[{label}] 完整堆栈:\n{tb}")
+        send_scraper_alarm(label, error_msg)
         return False
 
 
@@ -138,7 +251,7 @@ def run_bridge() -> None:
         env = dict(os.environ)
         env["FORCE_UPDATE"] = "1"
         result = subprocess.run(
-            ["conda", "run", "-n", "job_env", "python", str(BRIDGE_SCRIPT)],
+            [sys.executable, str(BRIDGE_SCRIPT)],
             capture_output=False,  # 实时输出
             text=True,
             env=env,
