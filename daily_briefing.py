@@ -275,6 +275,20 @@ def _build_briefing_card(jobs: list[dict], match_points: list[str]) -> str:
 # ── 主流程 ──
 
 
+def _build_no_job_card() -> str:
+    """组装『无新增岗位』保活简报卡片"""
+    lines = [
+        "☀️ **InterviewOS | 今日早报 (无新增)**",
+        "📅 统计周期：过去 24 小时",
+        "📭 今日情况：未捕获到匹配度 >=80 的新岗位。",
+        "🛠️ 运行状态：爬虫流水线已执行完毕。",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "💡 *提示：此消息用于确认系统正常运行，只是今天确实没有符合条件的新岗位。*",
+    ]
+    return "\n".join(lines)
+
+
 def run_daily_briefing(chat_id: str) -> bool:
     """
     执行每日早报全流程。
@@ -290,8 +304,15 @@ def run_daily_briefing(chat_id: str) -> bool:
     # 1. 查询 Notion
     jobs = query_high_score_jobs_24h(min_score=80)
     if not jobs:
-        logger.info("[Briefing] 过去 24 小时无新增高分岗位，静默退出")
-        return False
+        logger.info("[Briefing] 过去 24 小时无新增高分岗位，推送『无更新』保活简报")
+        # ★ 容灾改造：不再静默退出，推送『无更新』简报卡片
+        no_job_card = _build_no_job_card()
+        ok = _send_feishu_message(chat_id, no_job_card)
+        if ok:
+            logger.info("[Briefing] ✅ 『无更新』保活简报已推送")
+        else:
+            logger.error("[Briefing] ❌ 『无更新』保活简报推送失败")
+        return ok
 
     # 2. AI 提炼匹配点
     match_points = _generate_match_points(jobs)
@@ -317,6 +338,7 @@ def run_daily_briefing(chat_id: str) -> bool:
     else:
         logger.error("[Briefing] ❌ 早报推送失败")
     return ok
+
 
 
 # ── 入口 ──

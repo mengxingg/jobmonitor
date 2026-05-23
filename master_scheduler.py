@@ -198,13 +198,18 @@ def run_full_workflow(
     else:
         logger.info("⏭️ 跳过爬虫抓取步骤 (--no-crawl)")
 
-    # ── 第二步：早报推送 ──
-    if not skip_briefing and not dry_run:
-        step_daily_briefing(chat_id)
-    elif dry_run:
-        logger.info("⏭️ --dry-run 模式，跳过早报推送")
-    else:
-        logger.info("⏭️ 跳过早报推送步骤 (--no-briefing)")
+    # ── 第二步：早报推送（放在 finally 中确保执行） ──
+    briefing_ok = False
+    try:
+        if not skip_briefing and not dry_run:
+            briefing_ok = step_daily_briefing(chat_id)
+        elif dry_run:
+            logger.info("⏭️ --dry-run 模式，跳过早报推送")
+        else:
+            logger.info("⏭️ 跳过早报推送步骤 (--no-briefing)")
+    except Exception as e:
+        logger.error(f"❌ 早报推送步骤异常: {e}", exc_info=True)
+        briefing_ok = False
 
     # ── 汇总 ──
     elapsed = time.time() - start_time
@@ -213,10 +218,11 @@ def run_full_workflow(
     print(f"{'=' * 60}")
     print(f"  爬虫抓取: {'✅ 完成' if crawl_ok else '⚠️ 部分失败'}")
     if not skip_briefing and not dry_run:
-        print(f"  早报推送: {'✅ 已执行' if not skip_briefing else '⏭️ 已跳过'}")
+        print(f"  早报推送: {'✅ 已执行' if briefing_ok else '⚠️ 已执行（无数据或推送失败）'}")
     print(f"  总耗时: {elapsed:.0f} 秒")
     print(f"  完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'=' * 60}\n")
+
 
 
 # ==========================================

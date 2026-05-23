@@ -199,35 +199,76 @@ def run_all_spiders() -> None:
       1. 三方平台：BOSS直聘、猎聘（使用 DrissionPage，独立浏览器）
       2. 官网 API 类：腾讯（requests，轻量）
       3. 官网 Playwright 类：字节、DeepSeek、小红书、月之暗面、智谱、MiniMax、阿里
+
+    【容灾设计】
+    每个爬虫调用均包裹在 try...except 中，确保单个平台崩溃不会阻断后续平台。
+    异常时仅发送一次告警，然后 continue 继续执行下一个平台。
     """
     start_time = time.time()
     print(f"\n{'='*60}")
     print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 启动全平台抓取")
     print(f"{'='*60}\n")
 
-    # ── 第一阶段：三方平台 ──
-    logger.info("📌 第一阶段：三方招聘平台")
-    _run_script("spider_boss.py", "BOSS直聘")
-    _run_script("spider_liepin.py", "猎聘")
+    # ── 定义爬虫执行计划 ──
+    spider_plan = [
+        # (脚本文件名, 平台标签)
+        # 第一阶段：三方平台
+        ("spider_boss.py", "BOSS直聘"),
+        ("spider_liepin.py", "猎聘"),
+        # 第二阶段：官网 API 类（轻量，无需浏览器）
+        # ("crawler_tencent.py", "腾讯"),  # 腾讯平台暂时注释，爬虫不稳定
+        # 第三阶段：官网 Playwright 类（需要浏览器）
+        ("bytedance_visual_crawler.py", "字节跳动"),
+        ("crawler_deepseek.py", "DeepSeek"),
+        ("crawler_xiaohongshu.py", "小红书"),
+        ("crawler_moonshot.py", "月之暗面"),
+        ("crawler_zhipu.py", "智谱AI"),
+        ("crawler_minimax.py", "MiniMax"),
+        ("crawler_alibaba.py", "阿里巴巴"),
+    ]
 
-    # ── 第二阶段：官网 API 类（轻量，无需浏览器） ──
-    logger.info("\n📌 第二阶段：官网 API 类爬虫")
-    _run_script("crawler_tencent.py", "腾讯")
 
-    # ── 第三阶段：官网 Playwright 类（需要浏览器） ──
-    logger.info("\n📌 第三阶段：官网 Playwright 爬虫")
-    _run_script("bytedance_visual_crawler.py", "字节跳动")
-    _run_script("crawler_deepseek.py", "DeepSeek")
-    _run_script("crawler_xiaohongshu.py", "小红书")
-    _run_script("crawler_moonshot.py", "月之暗面")
-    _run_script("crawler_zhipu.py", "智谱AI")
-    _run_script("crawler_minimax.py", "MiniMax")
-    _run_script("crawler_alibaba.py", "阿里巴巴")
+    # ── 阶段标签映射 ──
+    phase_map = {
+        "spider_boss.py": "📌 第一阶段：三方招聘平台",
+        "spider_liepin.py": None,  # 同属第一阶段，不重复打印
+        "crawler_tencent.py": "📌 第二阶段：官网 API 类爬虫",
+        "bytedance_visual_crawler.py": "📌 第三阶段：官网 Playwright 爬虫",
+    }
+
+    success_count = 0
+    fail_count = 0
+
+    for script_name, label in spider_plan:
+        # 打印阶段分隔
+        phase_title = phase_map.get(script_name)
+        if phase_title:
+            logger.info(f"\n{phase_title}")
+
+        # ★ 容灾核心：每个爬虫独立 try/except，崩溃不影响后续
+        try:
+            ok = _run_script(script_name, label)
+            if ok:
+                success_count += 1
+            else:
+                fail_count += 1
+        except Exception as e:
+            fail_count += 1
+            tb = traceback.format_exc()
+            error_msg = f"{e}\n{tb[:300]}"
+            logger.error(f"❌ [{label}] 未捕获的严重异常: {e}")
+            logger.debug(f"[{label}] 完整堆栈:\n{tb}")
+            # 仅发送一次告警，然后继续下一个平台
+            send_scraper_alarm(label, f"[严重异常] {error_msg}")
+            continue
 
     elapsed = time.time() - start_time
+    total = success_count + fail_count
     print(f"\n{'='*60}")
     print(f"✅ 全平台抓取完成！耗时 {elapsed:.0f} 秒")
+    print(f"   成功: {success_count}/{total} | 失败: {fail_count}/{total}")
     print(f"{'='*60}")
+
 
 
 def run_bridge() -> None:
