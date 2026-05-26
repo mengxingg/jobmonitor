@@ -4,9 +4,10 @@
 功能：
   1. 通过 WebSocket 长连接监听飞书 im.message.receive_v1 事件
   2. 解析用户发送的纯文本指令
-  3. 意图识别路由：深度分析（自然语言）/ 简报生成 / 兜底回复
-  4. 异步执行 OpenClaw 深度背调 + Notion 读写 + 飞书通知
-  5. 终端回显 + 飞书自动回复确认
+  3. 意图识别路由：菜单引导 / 9 平台爬虫 / 深度分析 / 简报 / 兜底
+  4. ChatOps 爬虫：后台串行拉起 spider_*.py / crawler_*.py，防 OOM
+  5. 异步执行 OpenClaw 深度背调 + Notion 读写 + 飞书通知
+  6. 终端回显 + 飞书自动回复确认
 
 使用方式：
   1. 在 .env 中配置 FEISHU_APP_ID / FEISHU_APP_SECRET / NOTION_API_KEY / NOTION_DATABASE_ID
@@ -23,7 +24,8 @@ import threading
 import asyncio
 import random
 import time
-from datetime import datetime, timedelta
+import traceback
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 # ── 全局 DEBUG 日志（强制打印所有底层报错） ──────────────
@@ -64,6 +66,93 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 OPENCLAW_JOBS_PATH = os.path.join(PROJECT_ROOT, "data", "openclaw_jobs.json")
 OPENCLAW_SKILL_DIR = os.path.expanduser("~/.openclaw/workspace/skills/job-monitor")
 OPENCLAW_TARGETS_PATH = os.path.join(OPENCLAW_SKILL_DIR, "targets.json")
+BRIDGE_SCRIPT = os.path.join(PROJECT_ROOT, "openclaw_bridge.py")
+
+# ── ChatOps 爬虫调度（9 平台架构，串行防 OOM） ──
+# 全量抓取顺序：严格串行，单脚本失败不阻断后续平台
+SPIDER_FULL_PLAN: list[tuple[str, str]] = [
+    ("spider_boss.py", "BOSS直聘"),
+    ("spider_liepin.py", "猎聘"),
+    ("bytedance_visual_crawler.py", "字节跳动"),
+    ("crawler_deepseek.py", "DeepSeek"),
+    ("crawler_xiaohongshu.py", "小红书"),
+    ("crawler_moonshot.py", "月之暗面"),
+    ("crawler_zhipu.py", "智谱"),
+    ("crawler_minimax.py", "MiniMax"),
+    ("crawler_alibaba.py", "阿里巴巴"),
+]
+
+# (脚本, 平台名, 主指令及别名) — 构建匹配表时按触发词长度降序
+SPIDER_PLATFORM_ENTRIES: list[tuple[str, str, tuple[str, ...]]] = [
+    ("spider_boss.py", "BOSS直聘", ("抓取BOSS直聘", "抓取boss直聘", "抓取BOSS", "抓BOSS直聘")),
+    ("spider_liepin.py", "猎聘", ("抓取猎聘", "抓猎聘")),
+    ("bytedance_visual_crawler.py", "字节跳动", ("抓取字节跳动", "抓取字节", "抓字节跳动")),
+    ("crawler_deepseek.py", "DeepSeek", ("抓取DeepSeek", "抓取deepseek", "抓DeepSeek")),
+    ("crawler_xiaohongshu.py", "小红书", ("抓取小红书", "抓小红书")),
+    ("crawler_moonshot.py", "月之暗面", ("抓取月之暗面", "抓取KIMI", "抓取kimi", "抓月之暗面")),
+    ("crawler_zhipu.py", "智谱", ("抓取智谱", "抓智谱")),
+    ("crawler_minimax.py", "MiniMax", ("抓取MiniMax", "抓取minimax", "抓MiniMax")),
+    ("crawler_alibaba.py", "阿里巴巴", ("抓取阿里巴巴", "抓取阿里", "抓阿里巴巴")),
+]
+
+SPIDER_PLATFORM_RULES: list[tuple[str, str, str]] = []
+for _script, _label, _triggers in SPIDER_PLATFORM_ENTRIES:
+    for _trigger in _triggers:
+        SPIDER_PLATFORM_RULES.append((_trigger, _script, _label))
+SPIDER_PLATFORM_RULES.sort(key=lambda r: len(r[0]), reverse=True)
+
+SPIDER_FULL_KEYWORDS = ("全面抓取", "更新所有岗位", "全量抓取", "抓取全部", "抓取所有")
+
+# 飞书 ChatOps 底部快捷菜单 · 引导文案（同步回复，不启后台任务）
+MENU_GUIDE_BACKTEST = (
+    "💡 深度情报侦察系统已就绪。请直接输入：\n\n"
+    "『帮我背调一下 [公司名称]』\n\n"
+    "例如：帮我背调一下 字节跳动"
+)
+MENU_GUIDE_CRAWL_OFFICIAL = (
+    "🕷️ 当前支持单点抓取的企业官网及 AI 独角兽如下，请直接输入对应指令：\n"
+    "- 抓取字节跳动\n"
+    "- 抓取DeepSeek\n"
+    "- 抓取小红书\n"
+    "- 抓取月之暗面\n"
+    "- 抓取智谱\n"
+    "- 抓取MiniMax\n"
+    "- 抓取阿里巴巴"
+)
+MENU_GUIDE_TRIGGERS: dict[str, str] = {
+    "背调指南": MENU_GUIDE_BACKTEST,
+    "深度背调": MENU_GUIDE_BACKTEST,
+    "抓取官网指南": MENU_GUIDE_CRAWL_OFFICIAL,
+}
+
+# 菜单固定文案 / 功能词，禁止当作公司名或误触发 OpenClaw
+MENU_STATIC_LABELS = frozenset({
+    "背调指南",
+    "深度背调",
+    "抓取官网指南",
+    "今日简报",
+    "全面抓取",
+    "更新所有岗位",
+})
+
+ENTITY_BLOCKLIST = frozenset({
+    "深度背调",
+    "背调指南",
+    "今日简报",
+    "抓取官网",
+    "抓取官网指南",
+    "全面抓取",
+    "更新所有",
+    "岗位抓取",
+    "情报侦察",
+    "深度情报",
+    "新岗位",
+    "岗位简报",
+    "高分岗位",
+})
+
+# 全局爬虫互斥锁：同一时刻只允许一个抓取任务（单平台或全量）
+_crawl_lock = threading.Lock()
 
 # ── 飞书消息发送（供后台线程调用） ──────────────────────
 
@@ -100,12 +189,17 @@ def _send_feishu_message(chat_id: str, text: str) -> None:
 # ── 实体提取 ──────────────────────────────────────────────
 
 
-def extract_company_name(text: str) -> Optional[str]:
+def extract_company_name(text: str, *, allow_fallback: bool = True) -> Optional[str]:
     """
     从用户自然语言指令中提取目标公司名称。
     例如："帮我背调一下字节跳动" → "字节跳动"
           "分析一下阿里巴巴的岗位" → "阿里巴巴"
     """
+    normalized = text.strip()
+    if not normalized or normalized in MENU_STATIC_LABELS:
+        logger.warning("[Entity] 菜单固定文案，跳过公司名提取")
+        return None
+
     # 优先从 targets.json 中匹配已知公司名
     try:
         with open(OPENCLAW_TARGETS_PATH, "r", encoding="utf-8") as f:
@@ -118,19 +212,109 @@ def extract_company_name(text: str) -> Optional[str]:
     known_companies.sort(key=len, reverse=True)
 
     for company in known_companies:
-        if company in text:
+        if company in normalized:
             logger.info(f"[Entity] 从指令中提取到公司名: {company}")
             return company
 
-    # 兜底：尝试提取任意中文公司名（2-6 个中文字符）
-    fallback_match = re.search(r"([\u4e00-\u9fa5]{2,6})", text)
-    if fallback_match:
+    if not allow_fallback:
+        logger.warning("[Entity] 未匹配已知公司（未启用兜底提取）")
+        return None
+
+    # 兜底：尝试提取任意中文公司名（2-6 个中文字符），排除菜单/功能词
+    for fallback_match in re.finditer(r"([\u4e00-\u9fa5]{2,8})", normalized):
         candidate = fallback_match.group(1)
+        if candidate in ENTITY_BLOCKLIST:
+            continue
+        if any(blocked in candidate for blocked in ("背调", "简报", "抓取", "指南")):
+            continue
         logger.info(f"[Entity] 未匹配已知公司，使用兜底提取: {candidate}")
         return candidate
 
     logger.warning("[Entity] 无法从指令中提取公司名")
     return None
+
+
+def is_research_command(text: str) -> bool:
+    """
+    判断是否为「带公司名的深度背调」自然语言指令。
+    菜单项「深度背调」「背调指南」等固定文案不命中。
+    """
+    normalized = text.strip()
+    if not normalized or normalized in MENU_STATIC_LABELS:
+        return False
+    if normalized in MENU_GUIDE_TRIGGERS:
+        return False
+
+    strong_patterns = (
+        "帮我背调",
+        "背调一下",
+        "背调下",
+        "请背调",
+        "帮我分析",
+        "分析一下",
+        "分析下",
+        "深度分析",
+        "研究一下",
+    )
+    if any(p in normalized for p in strong_patterns):
+        return True
+
+    if any(kw in normalized for kw in ("分析", "研究", "看看")):
+        return extract_company_name(normalized, allow_fallback=False) is not None
+
+    if "背调" in normalized:
+        return extract_company_name(normalized, allow_fallback=False) is not None
+
+    return False
+
+
+def _parse_notion_timestamp(ts: Optional[str]) -> Optional[datetime]:
+    """解析 Notion ISO8601 时间戳为 UTC aware datetime。"""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _parse_discovered_date_from_props(props: dict) -> Optional[datetime]:
+    """从 Notion 页面属性读取 Discovered Date。"""
+    date_field = props.get("Discovered Date", {}).get("date") or {}
+    start = date_field.get("start")
+    if not start:
+        return None
+    try:
+        if "T" in start:
+            return datetime.fromisoformat(start.replace("Z", "+00:00"))
+        return datetime.fromisoformat(start + "T00:00:00+00:00")
+    except ValueError:
+        return None
+
+
+def _is_job_within_24h(page: dict, cutoff_utc: datetime) -> bool:
+    """
+    岗位是否属于过去 24 小时内：
+      - 以 Notion 页面 created_time（入库时间）为准（主条件）
+      - 若存在 Discovered Date 且早于 cutoff，则排除（避免 5/22 旧帖）
+    """
+    created = _parse_notion_timestamp(page.get("created_time"))
+    if created is None:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if created < cutoff_utc:
+        return False
+
+    props = page.get("properties", {})
+    discovered = _parse_discovered_date_from_props(props)
+    if discovered is not None:
+        if discovered.tzinfo is None:
+            discovered = discovered.replace(tzinfo=timezone.utc)
+        if discovered < cutoff_utc:
+            return False
+
+    return True
 
 
 # ── Notion 查询 ───────────────────────────────────────────
@@ -203,17 +387,17 @@ def query_notion_by_company(company: str) -> list[dict]:
         return []
 
 
-def query_notion_recent_24h(min_score: int = 80) -> list[dict]:
+def query_notion_recent_24h() -> list[dict]:
     """
-    查询 Notion 数据库中过去 24 小时内新增的岗位记录。
-    筛选条件：Created Time 属于过去 24 小时，且 Match Score >= min_score。
-    按匹配度降序排列。
-
-    参数:
-        min_score: 最低匹配度分数（默认 80）
+    查询 Notion 数据库中过去 24 小时内新增的岗位记录（不限匹配分数）。
+    筛选条件：
+      - 页面 created_time（入库时间）在过去 24 小时内
+      - Discovered Date 不得早于 cutoff（排除历史帖被误收录）
+    按入库时间降序排列。
 
     返回:
-        岗位列表，每项包含 title, company, score, url, location, salary, page_id
+        岗位列表，每项包含 title, company, score, url, location, salary, page_id,
+        discovered_date, notion_created_time
     """
     if not NOTION_API_KEY or not NOTION_DATABASE_ID:
         logger.error("[Notion] API 密钥或数据库 ID 未配置")
@@ -225,25 +409,17 @@ def query_notion_recent_24h(min_score: int = 80) -> list[dict]:
         "Content-Type": "application/json",
     }
 
-    yesterday = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    cutoff_utc = datetime.now(timezone.utc) - timedelta(hours=24)
 
     filter_body = {
         "filter": {
-            "and": [
-                {
-                    "property": "Discovered Date",
-                    "date": {"on_or_after": yesterday},
-                },
-                {
-                    "property": "Match Score",
-                    "number": {"greater_than_or_equal_to": min_score},
-                },
-            ],
+            "timestamp": "created_time",
+            "created_time": {"after": cutoff_utc.isoformat()},
         },
         "sorts": [
-            {"property": "Match Score", "direction": "descending"},
+            {"timestamp": "created_time", "direction": "descending"},
         ],
-        "page_size": 20,
+        "page_size": 50,
     }
 
     try:
@@ -257,10 +433,19 @@ def query_notion_recent_24h(min_score: int = 80) -> list[dict]:
         resp.raise_for_status()
         data = resp.json()
         results = data.get("results", [])
-        logger.info(f"[Notion] 过去 24 小时查询返回 {len(results)} 条记录（Match Score >= {min_score}）")
+        logger.info(f"[Notion] API 初筛返回 {len(results)} 条（created_time 过去 24h，不限分数）")
 
         jobs = []
         for page in results:
+            if not _is_job_within_24h(page, cutoff_utc):
+                props = page.get("properties", {})
+                disc = _parse_discovered_date_from_props(props)
+                created = _parse_notion_timestamp(page.get("created_time"))
+                logger.debug(
+                    f"[Notion] 二次过滤剔除: created={created}, discovered={disc}"
+                )
+                continue
+
             props = page.get("properties", {})
             title_field = props.get("Title", {}).get("title", [])
             title = title_field[0].get("text", {}).get("content", "") if title_field else ""
@@ -274,6 +459,19 @@ def query_notion_recent_24h(min_score: int = 80) -> list[dict]:
             salary_field = props.get("Salary Range", {}).get("rich_text", [])
             salary = salary_field[0].get("text", {}).get("content", "") if salary_field else ""
 
+            discovered_dt = _parse_discovered_date_from_props(props)
+            discovered_str = (
+                discovered_dt.astimezone().strftime("%Y-%m-%d")
+                if discovered_dt
+                else "未知"
+            )
+            created_dt = _parse_notion_timestamp(page.get("created_time"))
+            created_str = (
+                created_dt.astimezone().strftime("%Y-%m-%d %H:%M")
+                if created_dt
+                else "未知"
+            )
+
             jobs.append({
                 "page_id": page["id"],
                 "title": title,
@@ -282,9 +480,12 @@ def query_notion_recent_24h(min_score: int = 80) -> list[dict]:
                 "url": url,
                 "location": location,
                 "salary": salary,
+                "discovered_date": discovered_str,
+                "notion_created_time": created_str,
             })
 
-        return jobs
+        logger.info(f"[Notion] 过去 24 小时最终保留 {len(jobs)} 条岗位")
+        return jobs[:20]
 
     except Exception as e:
         logger.error(f"[Notion] 24h 查询失败: {e}", exc_info=True)
@@ -736,7 +937,7 @@ def generate_deep_research_report(company: str, jobs: list[dict], external_insig
 
 def generate_briefing_report(jobs: list[dict]) -> str:
     """
-    对过去 24 小时的高分岗位列表，调用 AI 生成极客风格早报卡片。
+    对过去 24 小时的岗位列表，调用 AI 生成极客风格早报卡片。
     
     返回严格对齐格式的早报文本，包含：
       - 标题 + 统计周期 + 岗位数量
@@ -752,10 +953,12 @@ def generate_briefing_report(jobs: list[dict]) -> str:
         jobs_text += (
             f"{i}. **{job.get('title', '未知')}** @ {job.get('company', '未知')}\n"
             f"   薪资: {job.get('salary', '面议')} | 地点: {job.get('location', '未知')}\n"
-            f"   匹配度: {job.get('score', 'N/A')}\n"
+            f"   匹配度: {job.get('score', 'N/A')} | "
+            f"发现日: {job.get('discovered_date', '未知')} | "
+            f"入库: {job.get('notion_created_time', '未知')}\n"
         )
 
-    prompt = f"""你是一位 AI 招聘简报编辑。以下是过去 24 小时内新增的高分 AI 产品经理岗位列表（匹配度 >= 80）。
+    prompt = f"""你是一位 AI 招聘简报编辑。以下是过去 24 小时内新增的 AI 产品经理岗位列表（不限匹配分数）。
 
 ## 岗位列表
 {jobs_text}
@@ -809,9 +1012,9 @@ def generate_briefing_report(jobs: list[dict]) -> str:
     # ── 组装极客风格早报卡片 ──
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
-        f"☀️ **InterviewOS | 今日高分岗位早报**",
-        f"📅 统计周期：过去 24 小时",
-        f"📈 今日新收录高分岗位：{len(jobs)} 个",
+        f"☀️ **InterviewOS | 今日岗位简报**",
+        f"📅 统计周期：过去 24 小时（按 Notion 入库时间）",
+        f"📈 今日新收录岗位：{len(jobs)} 个",
         f"",
         f"━━━━━━━━━━━━━━━━━━",
     ]
@@ -827,6 +1030,10 @@ def generate_briefing_report(jobs: list[dict]) -> str:
 
         lines.append(f"🏢 **{company} · {title}**")
         lines.append(f"💰 薪资：{salary} | 📍 地点：{location}")
+        lines.append(
+            f"📅 发现日：{job.get('discovered_date', '未知')} | "
+            f"入库：{job.get('notion_created_time', '未知')}"
+        )
         lines.append(f"🎯 核心匹配点：{match_pt}")
         if notion_link:
             lines.append(f"🔗 [查看详情]({notion_link})")
@@ -1040,19 +1247,24 @@ def _markdown_to_notion_blocks(markdown_text: str) -> list[dict]:
 def _background_briefing(chat_id: str) -> None:
     """
     后台执行简报生成全流程（在独立线程中运行，不阻塞 WebSocket 主线程）：
-      1. 查询 Notion 过去 24 小时新增高分岗位（Match Score >= 80）
-      2. 如果无新增高分岗位，静默退出，不打扰用户
+      1. 查询 Notion 过去 24 小时新增岗位（仅按时间筛选，不限分数）
+      2. 无新增时推送保活卡片
       3. 有则调用 AI 提炼核心匹配点，组装极客风格早报卡片
       4. 飞书推送格式化早报
     """
     try:
-        # 1. 查询 Notion（仅 Match Score >= 80 的高分岗位）
-        jobs = query_notion_recent_24h(min_score=80)
-        logger.info(f"[Briefing] 过去 24 小时查询到 {len(jobs)} 条高分岗位（Match Score >= 80）")
+        jobs = query_notion_recent_24h()
+        logger.info(f"[Briefing] 过去 24 小时查询到 {len(jobs)} 条岗位（仅时间筛选）")
 
-        # 2. 如果没有任何新增高分岗位，静默退出
         if not jobs:
-            logger.info("[Briefing] 过去 24 小时无新增高分岗位，静默退出")
+            logger.info("[Briefing] 过去 24 小时无新入库岗位，推送无更新卡片")
+            no_update_card = (
+                "☀️ **InterviewOS | 今日简报 (无新增)**\n"
+                "📅 统计周期：过去 24 小时（按 Notion 入库时间）\n"
+                "📭 未找到 24h 内新入库的岗位。\n"
+                "💡 可先发送「全面抓取」更新岗位库后再试。"
+            )
+            _send_feishu_message(chat_id, no_update_card)
             return
 
         # 3. AI 提炼核心匹配点 + 组装早报卡片
@@ -1088,15 +1300,295 @@ def trigger_daily_briefing(chat_id: str) -> None:
     logger.info("[DailyBriefing] 早报任务已在后台线程启动")
 
 
+# ── ChatOps 按需爬虫（串行、非阻塞网关） ─────────────────
+
+
+def parse_menu_guide_intent(text: str) -> Optional[str]:
+    """解析飞书快捷菜单引导指令，命中则返回固定回复文案。"""
+    normalized = text.strip()
+    if not normalized:
+        return None
+    # 精确匹配（菜单按钮默认文案）
+    if normalized in MENU_GUIDE_TRIGGERS:
+        return MENU_GUIDE_TRIGGERS[normalized]
+    # 容错：去掉 @机器人 前缀后再次匹配
+    for key, reply in MENU_GUIDE_TRIGGERS.items():
+        if key in normalized and len(normalized) <= len(key) + 4:
+            return reply
+    return None
+
+
+def parse_spider_intent(text: str) -> Optional[dict]:
+    """
+    解析爬虫 ChatOps 意图（9 平台精确映射）。
+
+    返回:
+        {"mode": "full", "plan": [(script, label), ...]}
+        {"mode": "single", "plan": [(script, label)], "label": "字节跳动"}
+        None — 非爬虫指令
+    """
+    normalized = text.strip()
+    if not normalized:
+        return None
+
+    if any(kw in normalized for kw in SPIDER_FULL_KEYWORDS):
+        return {"mode": "full", "plan": list(SPIDER_FULL_PLAN), "label": "全平台（9平台）"}
+
+    for trigger, script_name, platform_label in SPIDER_PLATFORM_RULES:
+        if trigger in normalized:
+            return {
+                "mode": "single",
+                "plan": [(script_name, platform_label)],
+                "label": platform_label,
+            }
+
+    return None
+
+
+def _run_spider_script(script_name: str, label: str) -> dict:
+    """在后台线程中串行执行单个爬虫脚本（阻塞当前线程，不阻塞 WebSocket）。"""
+    script_path = os.path.join(PROJECT_ROOT, script_name)
+    started_at = datetime.now()
+    t0 = time.time()
+
+    if not os.path.isfile(script_path):
+        return {
+            "ok": False,
+            "label": label,
+            "script": script_name,
+            "returncode": -1,
+            "elapsed": 0,
+            "error": f"脚本不存在: {script_path}",
+        }
+
+    logger.info(f"[Spider] 启动 {label} ({script_name})")
+    try:
+        result = subprocess.run(
+            [sys.executable, script_path],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=7200,
+        )
+        elapsed = time.time() - t0
+        stderr_tail = (result.stderr or "")[-400:]
+        if result.returncode == 0:
+            logger.info(f"[Spider] ✅ {label} 完成 ({elapsed:.0f}s)")
+            return {
+                "ok": True,
+                "label": label,
+                "script": script_name,
+                "returncode": result.returncode,
+                "elapsed": elapsed,
+                "started_at": started_at,
+                "stderr_tail": stderr_tail,
+            }
+        logger.error(f"[Spider] ❌ {label} 退出码 {result.returncode}")
+        return {
+            "ok": False,
+            "label": label,
+            "script": script_name,
+            "returncode": result.returncode,
+            "elapsed": elapsed,
+            "started_at": started_at,
+            "error": f"退出码 {result.returncode}",
+            "stderr_tail": stderr_tail,
+        }
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        return {
+            "ok": False,
+            "label": label,
+            "script": script_name,
+            "returncode": -1,
+            "elapsed": elapsed,
+            "started_at": started_at,
+            "error": "执行超时（7200s）",
+        }
+    except Exception as e:
+        elapsed = time.time() - t0
+        logger.error(f"[Spider] {label} 异常: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "label": label,
+            "script": script_name,
+            "returncode": -1,
+            "elapsed": elapsed,
+            "started_at": started_at,
+            "error": str(e),
+        }
+
+
+def _run_notion_bridge() -> dict:
+    """全量抓取结束后触发 Notion 桥接。"""
+    t0 = time.time()
+    output_file = os.path.join(PROJECT_ROOT, "data", "openclaw_jobs.json")
+    if not os.path.isfile(output_file):
+        return {"ok": False, "label": "Notion同步", "error": "data/openclaw_jobs.json 不存在", "elapsed": 0}
+    if os.path.getsize(output_file) < 1024:
+        return {"ok": False, "label": "Notion同步", "error": "openclaw_jobs.json 过小，跳过同步", "elapsed": 0}
+    if not os.path.isfile(BRIDGE_SCRIPT):
+        return {"ok": False, "label": "Notion同步", "error": "openclaw_bridge.py 不存在", "elapsed": 0}
+
+    env = dict(os.environ)
+    env["FORCE_UPDATE"] = "1"
+    try:
+        result = subprocess.run(
+            [sys.executable, BRIDGE_SCRIPT],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1800,
+        )
+        elapsed = time.time() - t0
+        if result.returncode == 0:
+            return {"ok": True, "label": "Notion同步", "elapsed": elapsed, "returncode": 0}
+        return {
+            "ok": False,
+            "label": "Notion同步",
+            "elapsed": elapsed,
+            "returncode": result.returncode,
+            "error": f"桥接脚本退出码 {result.returncode}",
+            "stderr_tail": (result.stderr or "")[-400:],
+        }
+    except Exception as e:
+        return {"ok": False, "label": "Notion同步", "elapsed": time.time() - t0, "error": str(e)}
+
+
+def _format_spider_result_card(result: dict) -> str:
+    """组装单平台抓取结果卡片（文本 Markdown）。"""
+    label = result.get("label", "未知平台")
+    elapsed = int(result.get("elapsed", 0))
+    script = result.get("script", "")
+    started_at = result.get("started_at")
+    time_str = started_at.strftime("%Y-%m-%d %H:%M:%S") if isinstance(started_at, datetime) else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if result.get("ok"):
+        lines = [
+            f"✅ **{label} 岗位抓取完成**",
+            f"⏱️ 开始时间：{time_str}",
+            f"⌛ 耗时：{elapsed} 秒",
+            f"📜 脚本：`{script}`" if script else "",
+            f"📊 退出码：{result.get('returncode', 0)}",
+        ]
+    else:
+        lines = [
+            f"❌ **{label} 岗位抓取失败**",
+            f"⏱️ 开始时间：{time_str}",
+            f"⌛ 耗时：{elapsed} 秒",
+            f"📜 脚本：`{script}`" if script else "",
+            f"📊 退出码：{result.get('returncode', 'N/A')}",
+            f"❗ 原因：{result.get('error', '未知错误')}",
+        ]
+        stderr_tail = result.get("stderr_tail", "").strip()
+        if stderr_tail:
+            lines.append(f"📝 日志尾部：\n```\n{stderr_tail}\n```")
+
+    return "\n".join(line for line in lines if line)
+
+
+def _background_crawl_serial(plan: list[tuple[str, str]], chat_id: str, *, run_bridge: bool) -> None:
+    """
+    后台串行执行爬虫计划；每个脚本结束后推送结果卡片。
+    全量模式：严格串行，单平台失败仅记录并 continue，不阻断后续脚本（防 OOM + 容灾）。
+    全量结束后可选触发 Notion 桥接。
+    """
+    success_count = 0
+    fail_count = 0
+    try:
+        for script_name, label in plan:
+            try:
+                result = _run_spider_script(script_name, label)
+            except Exception as e:
+                logger.error(f"[Spider] {label} 未预期异常，跳过并继续: {e}", exc_info=True)
+                result = {
+                    "ok": False,
+                    "label": label,
+                    "script": script_name,
+                    "returncode": -1,
+                    "elapsed": 0,
+                    "started_at": datetime.now(),
+                    "error": f"调度层异常（已跳过）: {e}",
+                }
+            if result.get("ok"):
+                success_count += 1
+            else:
+                fail_count += 1
+                logger.warning(f"[Spider] {label} 失败，继续下一个平台（{fail_count}/{len(plan)}）")
+            _send_feishu_message(chat_id, _format_spider_result_card(result))
+
+        if run_bridge:
+            bridge_result = _run_notion_bridge()
+            _send_feishu_message(chat_id, _format_spider_result_card({
+                **bridge_result,
+                "script": "openclaw_bridge.py",
+                "started_at": datetime.now(),
+            }))
+
+        if len(plan) > 1:
+            summary = (
+                f"📦 **全平台抓取批次结束**\n"
+                f"✅ 成功：{success_count} | ❌ 失败：{fail_count} | 共 {len(plan)} 个平台"
+            )
+            if run_bridge:
+                summary += "\n🔄 已尝试执行 Notion 同步桥接"
+            _send_feishu_message(chat_id, summary)
+
+    except Exception as e:
+        logger.error(f"[Spider] 串行抓取流程异常: {e}", exc_info=True)
+        _send_feishu_message(chat_id, f"❌ 爬虫调度异常: {e}\n{traceback.format_exc()[-500:]}")
+    finally:
+        _crawl_lock.release()
+        logger.info("[Spider] 抓取任务结束，已释放互斥锁")
+
+
+def _start_spider_crawl(intent: dict, chat_id: str) -> Optional[str]:
+    """
+    尝试启动爬虫后台任务。成功返回即时确认文案；若已有任务在跑则返回占用提示。
+    """
+    if not _crawl_lock.acquire(blocking=False):
+        return "⚠️ 已有抓取任务正在串行执行中，请等待当前批次完成后再下发新指令。"
+
+    mode = intent["mode"]
+    label = intent["label"]
+    plan = intent["plan"]
+    run_bridge = mode == "full"
+
+    if mode == "full":
+        ack = (
+            f"⏳ 收到指令，已启动**全平台**岗位抓取（共 {len(plan)} 个平台，严格串行）。"
+            f"为保护本地内存，采用串行安全模式运行；失败平台将自动跳过并继续，"
+            f"每完成一个平台将推送结果卡片…"
+        )
+    else:
+        ack = (
+            f"⏳ 收到指令，已启动**{label}**岗位抓取。"
+            f"任务在后台 subprocess 执行，不阻塞网关；完成后将推送结果卡片…"
+        )
+
+    t = threading.Thread(
+        target=_background_crawl_serial,
+        args=(plan, chat_id),
+        kwargs={"run_bridge": run_bridge},
+        daemon=True,
+    )
+    t.start()
+    logger.info(f"[Spider] 后台串行任务已启动 mode={mode} platforms={len(plan)}")
+    return ack
+
+
 # ── 意图识别与路由 ────────────────────────────────────────
 
 
 def route_intent(text: str, chat_id: str) -> Optional[str]:
     """
     根据用户输入的文本进行意图识别，返回回复内容。
-    场景 A：包含"分析"/"背调"/"研究"/"看看" → 深度分析（后台异步执行）
-    场景 B：包含"早报"/"简报"/"新岗位"/"汇总" → 简报生成（后台异步执行）
-    场景 C：兜底回复
+    场景 A：菜单引导（背调指南 / 抓取官网指南）→ 固定文案
+    场景 B：按需爬虫（9 平台 / 全面抓取）→ 后台串行 subprocess
+    场景 C：包含"分析"/"背调"/"研究"/"看看" → 深度分析（后台异步执行）
+    场景 D：包含"早报"/"简报"/"新岗位"/"汇总" → 简报生成（后台异步执行）
+    场景 E：兜底回复
 
     注意：此函数仅返回回复文本，不发送飞书消息。
     飞书消息的发送统一由 do_p2_im_message_receive_v1 处理，避免重复发送。
@@ -1118,9 +1610,20 @@ def route_intent(text: str, chat_id: str) -> Optional[str]:
             "🛑 已收到中止指令，网关已停止下发新任务。"
         )
 
-    # ── 场景 A：深度分析 ──
-    research_keywords = ["分析", "背调", "研究", "看看"]
-    if any(kw in text for kw in research_keywords):
+    # ── 场景 A：飞书 ChatOps 快捷菜单引导（须在「背调」关键词之前） ──
+    menu_reply = parse_menu_guide_intent(text)
+    if menu_reply:
+        logger.info(f"[Router] 识别到菜单引导指令: {text.strip()}")
+        return menu_reply
+
+    # ── 场景 B：按需爬虫 ChatOps（9 平台精确映射，优先于背调） ──
+    spider_intent = parse_spider_intent(text)
+    if spider_intent:
+        logger.info(f"[Router] 识别到爬虫指令 mode={spider_intent['mode']}: {text}")
+        return _start_spider_crawl(spider_intent, chat_id)
+
+    # ── 场景 C：深度分析（须含公司名或明确句式；菜单「深度背调」已在场景 A 拦截） ──
+    if is_research_command(text):
         logger.info(f"[Router] 识别到深度分析指令: {text}")
         # 在后台线程中执行耗时操作，不阻塞主线程
         t = threading.Thread(target=_background_research, args=(text, chat_id), daemon=True)
@@ -1130,22 +1633,30 @@ def route_intent(text: str, chat_id: str) -> Optional[str]:
             "并执行深度背调，请稍候..."
         )
 
-    # ── 场景 B：简报生成 ──
-    briefing_keywords = ["早报", "简报", "新岗位", "汇总"]
-    if any(kw in text for kw in briefing_keywords):
+    # ── 场景 D：简报生成（含菜单「今日简报」） ──
+    normalized = text.strip()
+    briefing_triggers = ("今日简报", "早报", "简报", "新岗位", "汇总")
+    if normalized == "今日简报" or (
+        any(kw in text for kw in briefing_triggers)
+        and normalized not in MENU_GUIDE_TRIGGERS
+    ):
         logger.info("[Router] 识别到简报生成指令")
         t = threading.Thread(target=_background_briefing, args=(chat_id,), daemon=True)
         t.start()
         return (
             "📊 正在读取 Notion 数据库过去 24 小时的数据，"
-            "为您生成高分岗位简报..."
+            "为您生成今日岗位简报..."
         )
 
-    # ── 场景 C：兜底回复 ──
+    # ── 场景 E：兜底回复 ──
     logger.info("[Router] 未识别到特定指令，使用兜底回复")
     return (
-        "🤖 我是 InterviewOS 中枢。你可以对我说："
-        "'帮我背调一下字节跳动'，或者'今天有什么新岗位简报'。"
+        "🤖 我是 InterviewOS 中枢。你可以对我说：\n"
+        "• 点底部菜单 **背调指南** / **抓取官网指南** 查看用法\n"
+        "• **抓取BOSS直聘** / **抓取字节跳动** 等 — 单平台抓取（9 平台）\n"
+        "• **全面抓取** — 9 平台严格串行全量抓取\n"
+        "• **帮我背调一下字节跳动** — OpenClaw 深度背调\n"
+        "• **今日简报** — 24h 内新入库岗位（不限分数）"
     )
 
 
@@ -1238,7 +1749,7 @@ def main():
     logger.info("🚀 InterviewOS 飞书 WebSocket 网关启动中...")
     logger.info(f"   APP_ID: {str(APP_ID)[:8]}...{str(APP_ID)[-4:]}")
     logger.info("   监听事件: im.message.receive_v1")
-    logger.info("   路由场景: 深度分析 / 简报生成 / 兜底回复")
+    logger.info("   路由场景: 菜单引导 / 9平台爬虫 / 深度分析 / 简报 / 兜底")
     logger.info("=" * 50)
 
     # 检查密钥是否已配置
