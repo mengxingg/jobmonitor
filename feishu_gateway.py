@@ -26,7 +26,9 @@ import random
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional, Set
+
+import requests as http_requests
 
 # ── 全局 DEBUG 日志（强制打印所有底层报错） ──────────────
 logging.basicConfig(
@@ -38,7 +40,7 @@ logger = logging.getLogger("feishu_gateway")
 
 # ── 飞书消息去重缓存池 ──────────────────────────────────
 # 记录已处理过的 message_id，防止飞书"至少投递一次"重传机制导致重复执行
-processed_message_ids: set[str] = set()
+processed_message_ids: Set[str] = set()
 
 from notion_sync import replace_report_blocks, REPORT_ANCHOR_TEXT
 
@@ -135,6 +137,25 @@ MENU_STATIC_LABELS = frozenset({
     "更新所有岗位",
 })
 
+# AI 资讯雷达 · 飞书底部子菜单暗号（与后台一字不差，共 6 条）
+AI_HOT_MENU_COMMANDS = [
+    "看今日日报",
+    "看精选条目",
+    "看本周动态",
+    "模型发布",
+    "产品发布",
+    "行业动态",
+]
+AI_HOT_MENU_COMMANDS_SET = frozenset(AI_HOT_MENU_COMMANDS)
+
+# 合并进菜单静态词表，避免误触背调/实体提取
+MENU_STATIC_LABELS = MENU_STATIC_LABELS | AI_HOT_MENU_COMMANDS_SET
+
+NODE_NEWS_CARD_API = os.getenv(
+    "NODE_NEWS_CARD_API",
+    "http://127.0.0.1:3001/internal/news-card",
+)
+
 ENTITY_BLOCKLIST = frozenset({
     "深度背调",
     "背调指南",
@@ -149,6 +170,7 @@ ENTITY_BLOCKLIST = frozenset({
     "新岗位",
     "岗位简报",
     "高分岗位",
+    *AI_HOT_MENU_COMMANDS,
 })
 
 # 全局爬虫互斥锁：同一时刻只允许一个抓取任务（单平台或全量）
@@ -156,8 +178,33 @@ _crawl_lock = threading.Lock()
 
 # ── 飞书消息发送（供后台线程调用） ──────────────────────
 
+# 孤立 UTF-16 代理项（常见于 AI 摘要里的残缺 emoji）会导致 json.dumps 崩溃
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
-def _send_feishu_message(chat_id: str, text: str) -> None:
+
+def _sanitize_unicode_str(value: str) -> str:
+    if not isinstance(value, str):
+        return value
+    cleaned = _SURROGATE_RE.sub("\ufffd", value)
+    return cleaned.encode("utf-8", "replace").decode("utf-8")
+
+
+def _sanitize_for_feishu_json(value: Any) -> Any:
+    """递归清理卡片/文本中的非法 Unicode，避免 surrogates not allowed。"""
+    if isinstance(value, str):
+        return _sanitize_unicode_str(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_for_feishu_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_feishu_json(v) for v in value]
+    return value
+
+
+def _feishu_json_dumps(payload: Any) -> str:
+    return json.dumps(_sanitize_for_feishu_json(payload), ensure_ascii=False)
+
+
+def _send_feishu_message(chat_id: str, text: str) -> bool:
     """向指定会话发送飞书文本消息"""
     try:
         client = lark.Client.builder() \
@@ -168,7 +215,7 @@ def _send_feishu_message(chat_id: str, text: str) -> None:
         body = CreateMessageRequestBody.builder() \
             .receive_id(chat_id) \
             .msg_type("text") \
-            .content(json.dumps({"text": text}, ensure_ascii=False)) \
+            .content(_feishu_json_dumps({"text": text})) \
             .build()
 
         request = CreateMessageRequest.builder() \
@@ -179,11 +226,100 @@ def _send_feishu_message(chat_id: str, text: str) -> None:
         resp = client.im.v1.message.create(request)
         if not resp.success():
             logger.error(f"❌ 飞书消息发送失败: code={resp.code}, msg={resp.msg}")
-        else:
-            logger.info(f"📤 飞书消息已发送至 {chat_id}")
+            return False
+        logger.info(f"📤 飞书消息已发送至 {chat_id}")
+        return True
 
     except Exception as e:
         logger.error(f"❌ 飞书消息发送异常: {e}")
+        return False
+
+
+def _send_feishu_interactive_card(chat_id: str, card: dict) -> bool:
+    """向指定会话发送飞书 interactive 消息卡片"""
+    try:
+        client = lark.Client.builder() \
+            .app_id(APP_ID) \
+            .app_secret(APP_SECRET) \
+            .build()
+
+        body = CreateMessageRequestBody.builder() \
+            .receive_id(chat_id) \
+            .msg_type("interactive") \
+            .content(_feishu_json_dumps(card)) \
+            .build()
+
+        request = CreateMessageRequest.builder() \
+            .receive_id_type("chat_id") \
+            .request_body(body) \
+            .build()
+
+        resp = client.im.v1.message.create(request)
+        if not resp.success():
+            logger.error(f"❌ 飞书卡片发送失败: code={resp.code}, msg={resp.msg}")
+            return False
+        logger.info(f"📤 飞书卡片已发送至 {chat_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ 飞书卡片发送异常: {e}")
+        return False
+
+
+def try_forward_ai_hot_news_to_node(user_text: str, chat_id: str) -> bool:
+    """AI 资讯雷达 · 最高优先级（背调/爬虫/简报之前）。命中则转发 Node 并阻断后续路由。"""
+    normalized = user_text.strip()
+    if normalized not in AI_HOT_MENU_COMMANDS:
+        return False
+
+    logger.info(f"✅ 命中新闻菜单指令: {normalized}，准备转发 Node.js")
+    try:
+        resp = http_requests.post(
+            NODE_NEWS_CARD_API,
+            json={"text": normalized},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            payload = _sanitize_for_feishu_json(
+                json.loads(resp.content.decode("utf-8", errors="replace")),
+            )
+            if payload.get("error"):
+                _send_feishu_message(chat_id, "资讯雷达暂时离线。")
+                logger.error(f"Node.js 业务错误: {payload.get('error')}")
+                return True
+
+            sent_ok = False
+            msg_type = payload.get("msg_type")
+            if msg_type == "interactive" and payload.get("card"):
+                sent_ok = _send_feishu_interactive_card(chat_id, payload["card"])
+            elif msg_type == "text":
+                content = payload.get("content") or {}
+                sent_ok = _send_feishu_message(
+                    chat_id,
+                    content.get("text", "资讯雷达暂时离线。"),
+                )
+            else:
+                _send_feishu_message(chat_id, "资讯雷达暂时离线。")
+                logger.error("Node.js 返回格式无法识别")
+                return True
+
+            if sent_ok:
+                logger.info("✅ 新闻卡片已推送飞书")
+            else:
+                _send_feishu_message(chat_id, "资讯卡片发送失败，请稍后重试。")
+            return True
+
+        logger.error(f"Node.js 返回错误: {resp.status_code} {resp.text[:200]}")
+        _send_feishu_message(chat_id, "资讯雷达暂时离线。")
+        return True
+
+    except Exception as e:
+        logger.error(f"连接 Node.js 失败: {e}")
+        _send_feishu_message(
+            chat_id,
+            "资讯雷达暂时离线。请确认已执行：npm run feishu-local-api",
+        )
+        return True
 
 
 # ── 实体提取 ──────────────────────────────────────────────
@@ -1592,9 +1728,11 @@ def route_intent(text: str, chat_id: str) -> Optional[str]:
 
     注意：此函数仅返回回复文本，不发送飞书消息。
     飞书消息的发送统一由 do_p2_im_message_receive_v1 处理，避免重复发送。
+
+    AI 资讯菜单已在 do_p2_im_message_receive_v1 最前转发 Node，不会进入本函数。
     """
     # ════════════════════════════════════════════════════════════
-    # ⚡ 场景 0：系统拦截层（最高优先级）
+    # ⚡ 场景 0：系统拦截层（本函数内最高优先级）
     # 用户说"停止分析"、"取消"、"别弄了"等，必须立即拦截，
     # 绝对不能因为包含"分析"二字而误触发深度分析路由。
     #
@@ -1603,6 +1741,14 @@ def route_intent(text: str, chat_id: str) -> Optional[str]:
     #   2. 回复飞书用户："🛑 已收到中止指令，网关已停止下发新任务。"
     #   3. 立刻 return，绝对不允许代码继续往下匹配其他场景！
     # ════════════════════════════════════════════════════════════
+    normalized_route = text.strip()
+    if normalized_route in AI_HOT_MENU_COMMANDS:
+        logger.warning(
+            "[Router] AI 资讯指令误入 route_intent，应已在消息入口拦截: %s",
+            normalized_route,
+        )
+        return None
+
     stop_keywords = ["停止", "取消", "终止", "别弄了", "stop"]
     if any(kw in text for kw in stop_keywords):
         logger.info(f"[Router] 识别到紧急中止指令: {text}")
@@ -1717,6 +1863,13 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
             logger.info("⏭️ 跳过空消息")
             return
 
+        # ════════════════════════════════════════════════════════════
+        # 🚨 最高优先级：AI 资讯雷达菜单（必须在背调/爬虫/停止指令等之前）
+        # 命中后转发 Node.js :3001，return 阻断，绝不进入 route_intent
+        # ════════════════════════════════════════════════════════════
+        if try_forward_ai_hot_news_to_node(text, chat_id):
+            return
+
         # ── 终端回显 ──
         sender_id = sender.sender_id.open_id if sender and sender.sender_id else "unknown"
         logger.info(f"📩 收到飞书指令: {text}")
@@ -1749,7 +1902,8 @@ def main():
     logger.info("🚀 InterviewOS 飞书 WebSocket 网关启动中...")
     logger.info(f"   APP_ID: {str(APP_ID)[:8]}...{str(APP_ID)[-4:]}")
     logger.info("   监听事件: im.message.receive_v1")
-    logger.info("   路由场景: 菜单引导 / 9平台爬虫 / 深度分析 / 简报 / 兜底")
+    logger.info("   路由场景: AI资讯→Node / 菜单引导 / 9平台爬虫 / 深度分析 / 简报 / 兜底")
+    logger.info(f"   Node 卡片 API: {NODE_NEWS_CARD_API}")
     logger.info("=" * 50)
 
     # 检查密钥是否已配置
