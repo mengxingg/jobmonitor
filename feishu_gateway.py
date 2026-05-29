@@ -25,8 +25,9 @@ import asyncio
 import random
 import time
 import traceback
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Set
+from typing import Any, Optional
 
 import requests as http_requests
 
@@ -38,9 +39,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("feishu_gateway")
 
-# ── 飞书消息去重缓存池 ──────────────────────────────────
-# 记录已处理过的 message_id，防止飞书"至少投递一次"重传机制导致重复执行
-processed_message_ids: Set[str] = set()
+# ── 飞书消息去重滑动窗口 ──────────────────────────────────
+# 记录最近 1000 条已处理的 message_id，防止飞书"至少投递一次"重传机制导致重复执行
+# maxlen 满时自动淘汰最老的 ID，无需手动清空
+processed_message_ids: deque[str] = deque(maxlen=1000)
 
 from notion_sync import replace_report_blocks, REPORT_ANCHOR_TEXT
 
@@ -1841,11 +1843,7 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
             if msg_id in processed_message_ids:
                 logger.info(f"[Deduplication] 拦截到飞书重传的重复消息，直接忽略: {msg_id}")
                 return
-            processed_message_ids.add(msg_id)
-            # 限制缓存大小，防止内存溢出
-            if len(processed_message_ids) > 1000:
-                processed_message_ids.clear()
-                logger.info("[Deduplication] 去重缓存池已清空（超过 1000 条上限）")
+            processed_message_ids.append(msg_id)
 
         chat_id = message.chat_id or ""
         msg_type = message.message_type or ""
